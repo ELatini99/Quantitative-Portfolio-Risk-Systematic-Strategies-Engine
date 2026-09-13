@@ -27,6 +27,8 @@ The project combines:
 quant_portfolio_risk_engine/
 │
 ├── main.py                    # Research pipeline / analysis
+├── LICENSE                    # MIT License
+├── PATCH_NOTES.md             # Changelog of every bug found and fixed during development
 │
 ├── src/
 │   ├── __init__.py
@@ -269,6 +271,21 @@ Then start with:
 ```text
 results/quantitative_analysis.xlsx
 ```
+
+
+## Example results
+
+The `results/` directory in this repository contains example output from
+an actual run against live market data. Each run of `python main.py`
+overwrites `results/` with fresh output reflecting current prices, so
+treat the committed files as a snapshot/demo rather than a live feed —
+re-run the pipeline yourself for up-to-date numbers.
+
+
+## License
+
+Licensed under the MIT License — see [LICENSE](LICENSE) for details.
+
 
 The output structure is:
 
