@@ -1,0 +1,7 @@
+﻿Strategy,Annual Return (%),Annual Volatility (%),Sharpe Ratio,Max Drawdown (%),Correlation vs SPY,Tracking Error (%),Information Ratio,Excess Ann. Return vs SPY (%)
+Minimum Variance,6.9906,9.5749,0.7537,-25.7858,0.5460,14.7120,-0.4872,-6.7045
+Risk Parity,8.5061,10.8466,0.8070,-26.5744,0.7745,11.4451,-0.4919,-5.1890
+Momentum,10.4867,14.9298,0.7429,-28.0139,0.7874,10.8800,-0.3023,-3.2084
+Equal Weight,10.3937,13.4972,0.8004,-26.7708,0.9118,7.6344,-0.4685,-3.3014
+Buy & Hold SPY,13.6951,17.5601,0.8191,-33.7173,,,,
+Momentum (Regime-Scaled),7.0048,9.6481,0.7501,-13.4739,0.6886,12.9653,-0.5510,-6.6903

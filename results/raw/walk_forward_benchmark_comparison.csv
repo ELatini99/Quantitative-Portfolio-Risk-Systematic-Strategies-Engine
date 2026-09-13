@@ -1,0 +1,5 @@
+﻿Strategy,Annual Return (%),Sharpe Ratio
+Momentum (OOS),10.4798,0.7156
+Equal Weight (same OOS days),10.4998,0.7624
+Buy & Hold SPY (same OOS days),14.2709,0.7840
+"Momentum (Regime-Scaled, OOS)",7.2002,0.7379

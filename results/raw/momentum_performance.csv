@@ -1,0 +1,2 @@
+﻿Strategy,Momentum Lookback (days),Top Fraction (%),Rebalance Frequency,Transaction Cost (bps),Annual Return (%),Annual Volatility (%),Sharpe Ratio,Max Drawdown (%),Historical VaR (%),Historical ES (%),Observations
+Cross-Sectional Momentum,126,30.0000,ME,5.0000,10.4867,14.9298,0.7429,-28.0139,2.6205,3.7427,2939

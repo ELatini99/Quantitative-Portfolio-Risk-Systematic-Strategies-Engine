@@ -1,0 +1,4 @@
+﻿Lookback (days),Rebalance Frequency,OOS Annual Return (%),OOS Annual Volatility (%),OOS Sharpe Ratio,OOS Max Drawdown (%),Annualized Turnover (x/yr),Folds
+126,ME,10.4798,15.6437,0.7156,-28.0139,4.7731,8
+126,QE,9.2257,17.9681,0.5816,-34.2474,2.8295,8
+126,W,7.6430,14.7155,0.5743,-34.0838,10.9466,8

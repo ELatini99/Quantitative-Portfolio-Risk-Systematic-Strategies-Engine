@@ -1,0 +1,1089 @@
+diff -ruN '--exclude=__pycache__' '--exclude=.pytest_cache' '--exclude=results' v03_orig/PATCH_NOTES.md v03/quant_portfolio_risk_engine_v03/PATCH_NOTES.md
+--- v03_orig/PATCH_NOTES.md	1970-01-01 00:00:00.000000000 +0000
++++ v03/quant_portfolio_risk_engine_v03/PATCH_NOTES.md	2026-09-02 22:20:42.241382366 +0000
+@@ -0,0 +1,123 @@
++# Patch Notes
++
++Fixes applied to `quant_portfolio_risk_engine_v03`, found during code
++review (full pipeline run, `pytest`, and manual inspection of every
++module).
++
++---
++
++## 1. `"M"` → `"ME"` pandas offset alias (crash on pandas ≥ 3.0)
++
++**Files:** `src/config.py`, `src/backtest.py` (function removed, see #2)
++
++`Config.rebalance_frequency` and the old `walk_forward_momentum()`
++helper used `resample("M")`. Pandas deprecated the `"M"` alias in 2.2 and
++**removed it entirely in 3.0** (`ValueError: Invalid frequency: M`).
++Since `requirements.txt` pins `pandas>=2.2`, a fresh `pip install` today
++resolves to pandas 3.x and this crashes immediately. Fixed to `"ME"`
++(month-end) everywhere.
++
++## 2. "Walk-forward" was advertised but not actually wired in
++
++**Files:** `src/backtest.py`, `src/momentum.py`, new `src/validation.py`, `main/main.py`
++
++The README listed "walk-forward backtesting" as a feature, and
++`Config.rebalance_frequency` existed, but `main.py` never called the one
++function that used it (`walk_forward_momentum`, which also contained the
++bug above) — the momentum backtest instead re-evaluated the top-fraction
++selection continuously (see #3). This has been split into two, now both
++real:
++
++- **Fixed-frequency rebalancing** is now built directly into
++  `cross_sectional_momentum_weights()` in `src/momentum.py`, using an
++  actual-trading-day rebalance schedule (`rebalance_schedule()` — see
++  #3). `Config.rebalance_frequency` is now genuinely used.
++- **Walk-forward *validation*** (rolling train/test out-of-sample folds)
++  is implemented in the new `src/validation.py` and wired into `main.py`
++  as pipeline stage `[9/10]`. It reports per-fold and aggregate
++  out-of-sample Sharpe/return/drawdown, a bar chart, and two new Excel
++  sheets (`WALK-FORWARD`, `WALK-FORWARD SUMMARY`).
++
++The old, buggy `walk_forward_momentum()` in `src/backtest.py` was
++removed (its correct logic now lives in `momentum.py`); `backtest.py`
++keeps only the general-purpose helpers (`buy_and_hold_returns`,
++`cumulative_wealth`, `turnover`).
++
++## 3. Momentum turnover was much higher than intended
++
++**File:** `src/momentum.py`
++
++`cross_sectional_momentum_weights()` re-selected the top-fraction assets
++on *every trading day* the ranking shifted, not on a fixed schedule —
++despite `Config.rebalance_frequency` implying monthly rebalancing.
++Measured on a 10-year synthetic panel: turnover changed on 371/2609
++days (~24x annualized). This also meant the root cause of bug #1 (the
++`"M"` alias) never surfaced in practice, because the intended monthly
++rebalancing path was never actually executed.
++
++Fixed: the function now builds a proper rebalance schedule from the
++*actual trading days* in the price index (`rebalance_schedule()`), not
++from `resample().last().index` calendar labels (which are frequently
++**not** trading days — the original root cause: checking
++`date in resampled_calendar_labels` would rarely match). Selections are
++now held between rebalance dates. Measured after the fix on the same
++panel: turnover changed on 67/2609 days (~5x annualized) — in line with
++monthly rebalancing.
++
++## 4. No offline fallback for market data
++
++**File:** `src/data.py`
++
++`download_prices()` raised immediately if `yfinance` could not reach
++Yahoo Finance (no internet, rate limiting, temporary outage), which
++meant the whole pipeline was unusable in that situation — including
++during a live demo or interview without a guaranteed connection.
++
++Added a synthetic multi-asset price panel generator
++(`_synthetic_prices()`, GBM with a one-factor market structure so the
++resulting covariance matrix stays realistic/non-diagonal) used as an
++automatic fallback, controlled by `Config.use_synthetic_fallback`
++(default `True`). A console message clearly flags when synthetic data is
++being used, so results are never silently mistaken for real market data.
++
++## 5. Covariance estimation: added Ledoit-Wolf shrinkage
++
++**File:** `src/covariance.py`, `requirements.txt` (added `scikit-learn`)
++
++Only sample and EWMA covariance were available. Added
++`ledoit_wolf_covariance()`, which shrinks the sample covariance towards
++a structured target — materially more stable than the raw sample
++covariance whenever the number of observations isn't much larger than
++the number of assets (the typical case). Portfolio construction
++(`minimum_variance_portfolio`, `risk_parity_portfolio`) now uses the
++shrinkage covariance by default; sample and EWMA are still computed and
++reported for comparison in `raw/covariance_comparison.csv` and the
++`COVARIANCE`/`SUMMARY` sheets. The shrinkage intensity (0 = pure sample
++covariance, 1 = pure structured target) is printed at runtime and logged
++in `RESULTS_GUIDE.md`.
++
++---
++
++## Other small consistency fixes
++
++- `main.py` previously hardcoded `top_fraction=0.30` in the momentum
++  call and `"Top Fraction (%)": 30.0` in the report, instead of using
++  `Config.top_fraction` (which existed but wasn't consulted). Now
++  consistent throughout, and a new `Config.top_fraction` field is the
++  single source of truth.
++- `main.py` step counters (`[N/8]` / `[9/9]`, inconsistent with each
++  other) are now a single consistent `[N/10]` sequence including the new
++  walk-forward stage.
++- Added unit tests for every fix above (`tests/test_core.py`): Ledoit-Wolf
++  shrinkage bounds, correct rebalance-schedule trading days, reduced
++  momentum turnover, and non-overlapping walk-forward folds. Test suite
++  grew from 3 to 7 tests, all passing.
++
++## Verification
++
++- `pytest tests/` → 7/7 passed.
++- Full pipeline (`python main/main.py`) run end to end with the offline
++  synthetic fallback (no live internet available in the review sandbox):
++  completes all 10 stages, produces the Excel report, all CSVs, and all
++  figures including the two new walk-forward outputs, with no errors or
++  warnings.
+diff -ruN '--exclude=__pycache__' '--exclude=.pytest_cache' '--exclude=results' v03_orig/README.md v03/quant_portfolio_risk_engine_v03/README.md
+--- v03_orig/README.md	2026-09-02 22:15:38.112007968 +0000
++++ v03/quant_portfolio_risk_engine_v03/README.md	2026-09-02 22:20:17.933540050 +0000
+@@ -4,16 +4,16 @@
+ 
+ The project combines:
+ 
+-- market-data acquisition and cleaning
++- market-data acquisition and cleaning (with an offline synthetic fallback)
+ - return and volatility analysis
+ - PCA-based factor decomposition
+-- rolling covariance estimation
+-- portfolio optimization
++- covariance estimation: sample, EWMA, and **Ledoit-Wolf shrinkage**
++- portfolio optimization (minimum variance, risk parity)
+ - Monte Carlo VaR / Expected Shortfall
+ - historical VaR / Expected Shortfall
+ - stress testing
+-- momentum-based systematic strategies
+-- walk-forward backtesting
++- momentum-based systematic strategies with fixed-frequency rebalancing
++- genuine **walk-forward validation** (rolling out-of-sample folds)
+ - transaction costs
+ - risk-adjusted performance analysis
+ 
+@@ -36,7 +36,8 @@
+ │   ├── risk.py
+ │   ├── stress.py
+ │   ├── momentum.py
+-│   └── backtest.py
++│   ├── backtest.py
++│   └── validation.py         # rolling train/test walk-forward validation
+ │
+ ├── tests/
+ ├── data/
+@@ -77,7 +78,24 @@
+ SPY, QQQ, IWM, EFA, EEM, TLT, GLD
+ ```
+ 
+-The pipeline downloads historical data through `yfinance`, computes returns, estimates risk, performs PCA, constructs an optimized portfolio, evaluates a momentum strategy, and writes figures/tables to `results/`.
++The pipeline downloads historical data through `yfinance`, computes returns, estimates risk, performs PCA, constructs an optimized portfolio, evaluates a momentum strategy, runs a walk-forward validation, and writes figures/tables to `results/`.
++
++If live data cannot be downloaded (no internet, Yahoo Finance rate limiting or outage), the pipeline automatically falls back to a reproducible synthetic multi-asset price panel, so it always runs end to end — a `[data] Live data unavailable...` message is printed when this happens. This is clearly synthetic data, only meant to keep the pipeline demoable; disable it via `Config(use_synthetic_fallback=False)` if you want a hard failure instead.
++
++### Walk-forward validation
++
++Momentum performance is also evaluated with a rolling walk-forward
++schedule (`src/validation.py`): a 3-year training/warm-up window is
++followed by a 1-year out-of-sample test window, stepped forward one year
++at a time. The momentum rule has no parameters fit on the training
++window (the lookback is fixed by design); the training window only
++provides warm-up history for the lookback and the rebalance schedule.
++Reported performance is aggregated strictly from each fold's
++out-of-sample segment, so a rule that only works in one historical
++regime cannot hide behind a single blended in-sample backtest. Results
++are in `results/raw/walk_forward_folds.csv`, `walk_forward_aggregate.csv`,
++and the `WALK-FORWARD` / `WALK-FORWARD SUMMARY` sheets of the Excel
++report.
+ 
+ ## Research philosophy
+ 
+@@ -95,6 +113,15 @@
+ 
+ The project is educational/research software, not investment advice.
+ 
++## Rebalancing
++
++The momentum sleeve rebalances at a fixed frequency (`Config.rebalance_frequency`,
++default month-end, `"ME"`) rather than re-evaluating the top-fraction
++selection on every trading day. The selected assets are held between
++rebalance dates and turnover is measured accordingly, so the transaction
++cost applied in the backtest reflects the intended trading frequency,
++not artificial daily churn.
++
+ 
+ ## Results and reporting
+ 
+diff -ruN '--exclude=__pycache__' '--exclude=.pytest_cache' '--exclude=results' v03_orig/main/main.py v03/quant_portfolio_risk_engine_v03/main/main.py
+--- v03_orig/main/main.py	2026-09-02 22:15:38.108679251 +0000
++++ v03/quant_portfolio_risk_engine_v03/main/main.py	2026-09-02 22:19:11.734270423 +0000
+@@ -21,7 +21,12 @@
+     annualized_volatility,
+ )
+ from src.factors import pca_factors, factor_loadings
+-from src.covariance import sample_covariance, ewma_covariance, correlation_matrix
++from src.covariance import (
++    sample_covariance,
++    ewma_covariance,
++    ledoit_wolf_covariance,
++    correlation_matrix,
++)
+ from src.optimization import minimum_variance_portfolio, risk_parity_portfolio
+ from src.risk import (
+     portfolio_returns,
+@@ -32,6 +37,7 @@
+ from src.stress import historical_stress, scenario_stress
+ from src.backtest import cumulative_wealth
+ from src.momentum import momentum_returns
++from src.validation import generate_folds, walk_forward_momentum_validation
+ from src.reporting import write_table, create_excel_report
+ 
+ 
+@@ -62,8 +68,16 @@
+     print("QUANTITATIVE PORTFOLIO RISK & SYSTEMATIC STRATEGIES ENGINE")
+     print("=" * 72)
+ 
+-    print("\n[1/8] Downloading market data...")
+-    prices = align_assets(download_prices(cfg.tickers, cfg.start, cfg.end))
++    print("\n[1/10] Downloading market data...")
++    prices = align_assets(
++        download_prices(
++            cfg.tickers,
++            cfg.start,
++            cfg.end,
++            use_synthetic_fallback=cfg.use_synthetic_fallback,
++            seed=cfg.random_seed,
++        )
++    )
+     returns = simple_returns(prices)
+ 
+     start_date = prices.index.min().date().isoformat()
+@@ -77,7 +91,7 @@
+     # ------------------------------------------------------------------
+     # 1. Asset performance
+     # ------------------------------------------------------------------
+-    print("\n[2/8] Computing asset performance statistics...")
++    print("\n[2/10] Computing asset performance statistics...")
+     summary = performance_summary(
+         returns,
+         annual_risk_free_rate=cfg.annual_risk_free_rate,
+@@ -113,7 +127,7 @@
+     # ------------------------------------------------------------------
+     # 2. PCA / factor structure
+     # ------------------------------------------------------------------
+-    print("[3/8] Estimating PCA factor structure...")
++    print("[3/10] Estimating PCA factor structure...")
+     n_components = min(5, len(cfg.tickers))
+     factors, explained = pca_factors(returns, n_components=n_components)
+     loadings = factor_loadings(returns, n_components=min(3, len(cfg.tickers)))
+@@ -150,11 +164,15 @@
+     # ------------------------------------------------------------------
+     # 3. Covariance and correlation
+     # ------------------------------------------------------------------
+-    print("[4/8] Estimating covariance and correlation matrices...")
++    print("[4/10] Estimating covariance and correlation matrices...")
+     cov_sample = sample_covariance(returns)
+     cov_ewma = ewma_covariance(returns)
++    cov_shrink, shrink_intensity = ledoit_wolf_covariance(returns)
+     corr = correlation_matrix(returns)
+ 
++    print(f"        Ledoit-Wolf shrinkage intensity: {shrink_intensity:.3f} "
++          f"(0 = pure sample cov, 1 = pure structured target)")
++
+     cov_sample.to_csv(
+         raw_dir / "sample_covariance.csv",
+         encoding="utf-8-sig",
+@@ -165,6 +183,11 @@
+         encoding="utf-8-sig",
+         float_format="%.6f",
+     )
++    cov_shrink.to_csv(
++        raw_dir / "ledoit_wolf_covariance.csv",
++        encoding="utf-8-sig",
++        float_format="%.6f",
++    )
+     corr.to_csv(
+         raw_dir / "correlation_matrix.csv",
+         encoding="utf-8-sig",
+@@ -181,8 +204,9 @@
+                     "Asset B": j,
+                     "Sample Covariance": cov_sample.loc[i, j],
+                     "EWMA Covariance": cov_ewma.loc[i, j],
+-                    "Difference": cov_ewma.loc[i, j] - cov_sample.loc[i, j],
+-                    "Difference (%)": (
++                    "Ledoit-Wolf Covariance": cov_shrink.loc[i, j],
++                    "Difference (EWMA - Sample)": cov_ewma.loc[i, j] - cov_sample.loc[i, j],
++                    "Difference (%) (EWMA vs Sample)": (
+                         100
+                         * (cov_ewma.loc[i, j] - cov_sample.loc[i, j])
+                         / abs(cov_sample.loc[i, j])
+@@ -201,19 +225,24 @@
+     # ------------------------------------------------------------------
+     # 4. Portfolio construction
+     # ------------------------------------------------------------------
+-    print("[5/8] Constructing portfolios...")
+-    w_minvar = minimum_variance_portfolio(cov_ewma)
+-    w_riskparity = risk_parity_portfolio(cov_ewma)
++    print("[5/10] Constructing portfolios...")
++    # Ledoit-Wolf shrinkage is used for portfolio construction: it is
++    # materially more stable than the raw sample covariance whenever T is
++    # not much larger than N, which is the case for most trading
++    # universes. Sample and EWMA covariances are still computed and
++    # reported above for comparison.
++    w_minvar = minimum_variance_portfolio(cov_shrink)
++    w_riskparity = risk_parity_portfolio(cov_shrink)
+ 
+-    rc_minvar = risk_contributions(w_minvar, cov_ewma)
+-    rc_rp = risk_contributions(w_riskparity, cov_ewma)
++    rc_minvar = risk_contributions(w_minvar, cov_shrink)
++    rc_rp = risk_contributions(w_riskparity, cov_shrink)
+ 
+     weights = pd.DataFrame(
+         {
+-            "Asset": cov_ewma.index,
+-            "Min Variance Weight (%)": w_minvar.reindex(cov_ewma.index).values * 100,
++            "Asset": cov_shrink.index,
++            "Min Variance Weight (%)": w_minvar.reindex(cov_shrink.index).values * 100,
+             "Min Variance Risk Contribution (%)": rc_minvar.values * 100,
+-            "Risk Parity Weight (%)": w_riskparity.reindex(cov_ewma.index).values * 100,
++            "Risk Parity Weight (%)": w_riskparity.reindex(cov_shrink.index).values * 100,
+             "Risk Parity Risk Contribution (%)": rc_rp.values * 100,
+         }
+     )
+@@ -230,7 +259,7 @@
+     # ------------------------------------------------------------------
+     # 5. Portfolio risk analytics
+     # ------------------------------------------------------------------
+-    print("[6/8] Computing VaR, Expected Shortfall and performance...")
++    print("[6/10] Computing VaR, Expected Shortfall and performance...")
+     risk_rows = []
+ 
+     for name, series in {
+@@ -276,7 +305,7 @@
+     # ------------------------------------------------------------------
+     # 6. Stress testing
+     # ------------------------------------------------------------------
+-    print("[7/8] Running stress tests...")
++    print("[7/10] Running stress tests...")
+     stress = historical_stress(returns, w_minvar, window=5)
+ 
+     historical_stress_report = pd.DataFrame(
+@@ -332,12 +361,13 @@
+     # ------------------------------------------------------------------
+     # 7. Momentum strategy
+     # ------------------------------------------------------------------
+-    print("[8/8] Backtesting momentum strategy...")
++    print("[8/10] Backtesting momentum strategy...")
+     momentum_r, momentum_weights = momentum_returns(
+         prices,
+         lookback=cfg.lookback_momentum,
+-        top_fraction=0.30,
++        top_fraction=cfg.top_fraction,
+         transaction_cost_bps=cfg.transaction_cost_bps,
++        rebalance_frequency=cfg.rebalance_frequency,
+     )
+ 
+     momentum_hvar, momentum_hes = historical_var_es(
+@@ -348,7 +378,8 @@
+             {
+                 "Strategy": "Cross-Sectional Momentum",
+                 "Momentum Lookback (days)": cfg.lookback_momentum,
+-                "Top Fraction (%)": 30.0,
++                "Top Fraction (%)": cfg.top_fraction * 100,
++                "Rebalance Frequency": cfg.rebalance_frequency,
+                 "Transaction Cost (bps)": cfg.transaction_cost_bps,
+                 "Annual Return (%)": annualized_return(momentum_r, cfg.trading_days) * 100,
+                 "Annual Volatility (%)": annualized_volatility(momentum_r, cfg.trading_days) * 100,
+@@ -384,6 +415,78 @@
+     )
+ 
+     # ------------------------------------------------------------------
++    # 8b. Walk-forward validation
++    # ------------------------------------------------------------------
++    print(f"[9/10] Running walk-forward validation "
++          f"({cfg.walk_forward_train_years}y train / {cfg.walk_forward_test_years}y test)...")
++    folds = generate_folds(
++        prices.index,
++        train_years=cfg.walk_forward_train_years,
++        test_years=cfg.walk_forward_test_years,
++        step_years=cfg.walk_forward_step_years,
++    )
++    oos_returns, fold_summary = walk_forward_momentum_validation(
++        prices,
++        folds,
++        lookback=cfg.lookback_momentum,
++        top_fraction=cfg.top_fraction,
++        transaction_cost_bps=cfg.transaction_cost_bps,
++        rebalance_frequency=cfg.rebalance_frequency,
++        trading_days=cfg.trading_days,
++        annual_risk_free_rate=cfg.annual_risk_free_rate,
++    )
++
++    if fold_summary.empty:
++        print("        Not enough history for a full walk-forward schedule with "
++              "these window sizes -- skipping (shrink the windows or use more history).")
++        wf_aggregate = pd.DataFrame()
++    else:
++        write_table(
++            fold_summary,
++            raw_dir / "walk_forward_folds.csv",
++            float_format="%.4f",
++        )
++        wf_aggregate = pd.DataFrame(
++            [
++                {
++                    "Metric": "Out-of-sample annual return (%)",
++                    "Value": annualized_return(oos_returns, cfg.trading_days) * 100,
++                },
++                {
++                    "Metric": "Out-of-sample annual volatility (%)",
++                    "Value": annualized_volatility(oos_returns, cfg.trading_days) * 100,
++                },
++                {
++                    "Metric": "Out-of-sample Sharpe ratio",
++                    "Value": sharpe_ratio(oos_returns, cfg.annual_risk_free_rate, cfg.trading_days),
++                },
++                {
++                    "Metric": "Out-of-sample max drawdown (%)",
++                    "Value": max_drawdown(oos_returns) * 100,
++                },
++                {"Metric": "Number of folds", "Value": len(fold_summary)},
++                {"Metric": "Out-of-sample observations", "Value": int(oos_returns.notna().sum())},
++            ]
++        )
++        write_table(
++            wf_aggregate,
++            raw_dir / "walk_forward_aggregate.csv",
++            float_format="%.4f",
++        )
++
++        plt.figure(figsize=(9, 5))
++        colors = ["#4C72B0" if s >= 0 else "#C44E52" for s in fold_summary["Sharpe Ratio"]]
++        plt.bar(fold_summary["Fold"].astype(str), fold_summary["Sharpe Ratio"], color=colors)
++        plt.axhline(0, linewidth=1, color="black")
++        plt.xlabel("Walk-forward fold")
++        plt.ylabel("Out-of-sample Sharpe ratio")
++        plt.title("Walk-Forward Validation — Out-of-Sample Sharpe by Fold")
++        plt.tight_layout()
++        wf_fig = figures_dir / "walk_forward_sharpe_by_fold.png"
++        plt.savefig(wf_fig, dpi=200, bbox_inches="tight")
++        plt.close()
++
++    # ------------------------------------------------------------------
+     # 8. Wealth curves
+     # ------------------------------------------------------------------
+     wealth = pd.DataFrame(
+@@ -414,7 +517,7 @@
+     # ------------------------------------------------------------------
+     # 9. Research-quality figures and Excel report
+     # ------------------------------------------------------------------
+-    print("\n[9/9] Building research report and visualizations...")
++    print("\n[10/10] Building research report and visualizations...")
+ 
+     plt.figure(figsize=(9, 7))
+     im = plt.imshow(corr.values, vmin=-1, vmax=1, cmap="RdBu_r")
+@@ -531,7 +634,10 @@
+         {"Metric": "Confidence level", "Value": cfg.confidence, "Unit": "probability"},
+         {"Metric": "Monte Carlo paths", "Value": cfg.monte_carlo_paths, "Unit": "paths"},
+         {"Metric": "Momentum lookback", "Value": cfg.lookback_momentum, "Unit": "trading days"},
++        {"Metric": "Rebalance frequency", "Value": cfg.rebalance_frequency, "Unit": "pandas offset alias"},
+         {"Metric": "Transaction cost", "Value": cfg.transaction_cost_bps, "Unit": "bps"},
++        {"Metric": "Walk-forward window", "Value": f"{cfg.walk_forward_train_years}y train / {cfg.walk_forward_test_years}y test", "Unit": "rolling"},
++        {"Metric": "Covariance estimator used for optimization", "Value": "Ledoit-Wolf shrinkage", "Unit": "-"},
+     ])
+ 
+     excel_tables = {
+@@ -549,6 +655,9 @@
+         "MOMENTUM WEIGHTS": avg_momentum_weights,
+         "BACKTEST": wealth.reset_index(),
+     }
++    if not fold_summary.empty:
++        excel_tables["WALK-FORWARD"] = fold_summary
++        excel_tables["WALK-FORWARD SUMMARY"] = wf_aggregate
+     titles = {
+         "SUMMARY": "Quantitative Portfolio Risk Engine — Executive Summary",
+         "ASSET PERFORMANCE": "Asset-Level Performance and Risk",
+@@ -563,6 +672,8 @@
+         "MOMENTUM": "Cross-Sectional Momentum Strategy",
+         "MOMENTUM WEIGHTS": "Average Momentum Portfolio Weights",
+         "BACKTEST": "Backtest Wealth Curves",
++        "WALK-FORWARD": "Walk-Forward Validation — Per-Fold Out-of-Sample Performance",
++        "WALK-FORWARD SUMMARY": "Walk-Forward Validation — Aggregate Out-of-Sample Performance",
+     }
+     subtitles = {name: f"Generated {as_of} | Universe: {', '.join(cfg.tickers)}" for name in excel_tables}
+     pct_cols = {
+@@ -573,17 +684,20 @@
+         "STRESS TEST": {"Portfolio Return (%)", "Portfolio Loss (%)"},
+         "MOMENTUM": {"Top Fraction (%)", "Annual Return (%)", "Annual Volatility (%)", "Max Drawdown (%)", "Historical VaR (%)", "Historical ES (%)"},
+         "MOMENTUM WEIGHTS": {"Average Weight (%)"},
++        "WALK-FORWARD": {"Annual Return (%)", "Annual Volatility (%)", "Max Drawdown (%)"},
+     }
+     dec_cols = {
+         "ASSET PERFORMANCE": {"Sharpe"}, "PCA LOADINGS": {c for c in pca_loadings.columns if c != "Asset"},
+         "CORRELATION": set(corr.columns), "COVARIANCE": set(cov_sample.columns),
+-        "RISK ANALYTICS": {"Sharpe Ratio"},
++        "RISK ANALYTICS": {"Sharpe Ratio"}, "WALK-FORWARD": {"Sharpe Ratio"},
+     }
+-    int_cols = {"ASSET PERFORMANCE": {"Observations"}, "RISK ANALYTICS": {"Observations"}, "SUMMARY": {"Observations", "Monte Carlo paths", "Momentum lookback"}}
++    int_cols = {"ASSET PERFORMANCE": {"Observations"}, "RISK ANALYTICS": {"Observations"}, "SUMMARY": {"Observations", "Monte Carlo paths", "Momentum lookback"}, "WALK-FORWARD": {"Fold", "Observations"}}
+     figures = {
+         "CORRELATION": corr_fig, "PCA": pca_fig, "PORTFOLIO": weights_fig,
+         "RISK ANALYTICS": var_fig, "STRESS TEST": stress_fig, "BACKTEST": wealth_fig,
+     }
++    if not fold_summary.empty:
++        figures["WALK-FORWARD"] = wf_fig
+     create_excel_report(
+         results_dir / "quantitative_analysis.xlsx",
+         excel_tables,
+@@ -611,21 +725,42 @@
+ ## Risk methodology
+ - Confidence level: {cfg.confidence:.0%}
+ - EWMA covariance decay: 0.94
++- Ledoit-Wolf shrinkage intensity (this run): {shrink_intensity:.3f}
+ - Monte Carlo paths: {cfg.monte_carlo_paths:,}
+ - Random seed: {cfg.random_seed}
+ 
+ ## Portfolio construction
+ - Minimum Variance: long-only, weights sum to 100%
+ - Risk Parity: approximate equal risk contribution, long-only
+-- Risk contributions are measured against the EWMA annualized covariance matrix.
++- Both portfolios are built on the **Ledoit-Wolf shrinkage covariance**
++  (more stable out-of-sample than the raw sample covariance when the
++  number of return observations is not much larger than the number of
++  assets). Sample and EWMA covariance are also computed and reported
++  for comparison. Risk contributions are measured against the same
++  shrinkage-covariance matrix used for construction.
+ 
+ ## Momentum
+ - Cross-sectional momentum
+ - Lookback: {cfg.lookback_momentum} trading days
+-- Top fraction: 30%
++- Top fraction: {cfg.top_fraction:.0%}
++- Rebalance frequency: {cfg.rebalance_frequency} (month-end; selection is
++  held between rebalances rather than re-evaluated every day, so
++  turnover reflects the intended trading frequency)
+ - Transaction cost: {cfg.transaction_cost_bps:.1f} bps
+ - Signals are shifted before returns are applied to avoid look-ahead bias.
+ 
++## Walk-forward validation
++- Rolling schedule: {cfg.walk_forward_train_years}y train / {cfg.walk_forward_test_years}y
++  test, stepped forward {cfg.walk_forward_step_years}y at a time.
++- The momentum rule has no parameters fit on the training window (the
++  lookback is fixed by design); the training window only provides
++  warm-up history for the lookback and rebalance schedule.
++- Performance is measured strictly on each fold's out-of-sample test
++  segment, then aggregated, so a rule that only works in one historical
++  regime cannot hide behind a single blended in-sample backtest number.
++- See `WALK-FORWARD` and `WALK-FORWARD SUMMARY` in the Excel report, or
++  `raw/walk_forward_folds.csv` / `raw/walk_forward_aggregate.csv`.
++
+ ## CSV conventions
+ - Percentages are explicitly labelled `(%)`.
+ - VaR and ES are reported as positive loss magnitudes.
+@@ -634,7 +769,7 @@
+ 
+ ## Files
+ - `quantitative_analysis.xlsx`: recruiter-facing Excel report with formatted tables and embedded figures.
+-- `figures/`: correlation heatmap, PCA, portfolio weights, risk contributions, wealth curves, drawdowns, VaR/ES and stress charts.
++- `figures/`: correlation heatmap, PCA, portfolio weights, risk contributions, wealth curves, drawdowns, VaR/ES, stress and walk-forward charts.
+ - `raw/`: machine-readable CSV exports of all underlying tables and time series.
+ """
+     (results_dir / "RESULTS_GUIDE.md").write_text(
+diff -ruN '--exclude=__pycache__' '--exclude=.pytest_cache' '--exclude=results' v03_orig/requirements.txt v03/quant_portfolio_risk_engine_v03/requirements.txt
+--- v03_orig/requirements.txt	2026-09-02 22:15:38.111993965 +0000
++++ v03/quant_portfolio_risk_engine_v03/requirements.txt	2026-09-02 22:16:19.705521547 +0000
+@@ -1,6 +1,7 @@
+ numpy>=2.0
+ pandas>=2.2
+ scipy>=1.13
++scikit-learn>=1.4
+ matplotlib>=3.9
+ yfinance==1.7.0
+ openpyxl>=3.1
+diff -ruN '--exclude=__pycache__' '--exclude=.pytest_cache' '--exclude=results' v03_orig/src/backtest.py v03/quant_portfolio_risk_engine_v03/src/backtest.py
+--- v03_orig/src/backtest.py	2026-09-02 22:15:38.112639734 +0000
++++ v03/quant_portfolio_risk_engine_v03/src/backtest.py	2026-09-02 22:16:41.629368063 +0000
+@@ -16,43 +16,3 @@
+ 
+ def turnover(weights: pd.DataFrame) -> pd.Series:
+     return weights.diff().abs().sum(axis=1).fillna(weights.abs().sum(axis=1))
+-
+-
+-def walk_forward_momentum(
+-    prices: pd.DataFrame,
+-    lookback: int = 126,
+-    top_fraction: float = 0.3,
+-    transaction_cost_bps: float = 5.0,
+-    rebalance_frequency: str = "M",
+-) -> tuple[pd.Series, pd.DataFrame]:
+-    """
+-    Walk-forward implementation of cross-sectional momentum.
+-
+-    The signal uses only historical prices and is shifted one day before
+-    returns are applied. Portfolio weights are updated at month-end.
+-    """
+-    daily_returns = prices.pct_change().fillna(0.0)
+-    scores = prices.pct_change(lookback)
+-
+-    rebalance_dates = scores.resample(rebalance_frequency).last().index
+-    weights = pd.DataFrame(0.0, index=prices.index, columns=prices.columns)
+-
+-    current = pd.Series(0.0, index=prices.columns)
+-
+-    for date in prices.index:
+-        if date in rebalance_dates:
+-            row = scores.loc[date].dropna()
+-            if len(row) > 0:
+-                n = max(1, int(len(row) * top_fraction + 0.999999))
+-                selected = row.nlargest(n).index
+-                current[:] = 0.0
+-                current.loc[selected] = 1.0 / len(selected)
+-        weights.loc[date] = current
+-
+-    weights = weights.shift(1).fillna(0.0)
+-
+-    gross = (weights * daily_returns).sum(axis=1)
+-    t = weights.diff().abs().sum(axis=1).fillna(weights.abs().sum(axis=1))
+-    costs = t * transaction_cost_bps / 10_000.0
+-
+-    return gross - costs, weights
+diff -ruN '--exclude=__pycache__' '--exclude=.pytest_cache' '--exclude=results' v03_orig/src/config.py v03/quant_portfolio_risk_engine_v03/src/config.py
+--- v03_orig/src/config.py	2026-09-02 22:15:38.112244517 +0000
++++ v03/quant_portfolio_risk_engine_v03/src/config.py	2026-09-02 22:15:54.569365266 +0000
+@@ -13,8 +13,27 @@
+     trading_days: int = 252
+     lookback_cov: int = 252
+     lookback_momentum: int = 126
+-    rebalance_frequency: str = "M"
++    top_fraction: float = 0.30
++    # NOTE: pandas >= 2.2 deprecates the "M" offset alias in favor of "ME"
++    # (month-end); pandas 3.0 removes "M" entirely. "ME" is required here.
++    rebalance_frequency: str = "ME"
+     annual_risk_free_rate: float = 0.0
+     transaction_cost_bps: float = 5.0
+     monte_carlo_paths: int = 100_000
+     random_seed: int = 42
++
++    # Walk-forward *validation* (rolling train/test folds), distinct from
++    # rebalance_frequency above (which controls how often the live
++    # portfolio trades). This is used to check that the momentum signal's
++    # performance is stable out-of-sample across different market regimes,
++    # not just over one single in-sample backtest.
++    walk_forward_train_years: int = 3
++    walk_forward_test_years: int = 1
++    walk_forward_step_years: int = 1
++
++    # If live market data cannot be downloaded (no internet, rate limit,
++    # temporary Yahoo Finance outage), fall back to a reproducible
++    # synthetic multi-asset price panel so the pipeline is always
++    # runnable end to end (useful for demos / interviews without a
++    # guaranteed connection).
++    use_synthetic_fallback: bool = True
+diff -ruN '--exclude=__pycache__' '--exclude=.pytest_cache' '--exclude=results' v03_orig/src/covariance.py v03/quant_portfolio_risk_engine_v03/src/covariance.py
+--- v03_orig/src/covariance.py	2026-09-02 22:15:38.112101304 +0000
++++ v03/quant_portfolio_risk_engine_v03/src/covariance.py	2026-09-02 22:16:17.164883264 +0000
+@@ -2,6 +2,7 @@
+ 
+ import numpy as np
+ import pandas as pd
++from sklearn.covariance import LedoitWolf
+ 
+ 
+ def sample_covariance(returns: pd.DataFrame, annualize: bool = True) -> pd.DataFrame:
+@@ -44,3 +45,24 @@
+ 
+ def correlation_matrix(returns: pd.DataFrame) -> pd.DataFrame:
+     return returns.corr()
++
++
++def ledoit_wolf_covariance(
++    returns: pd.DataFrame, annualize: bool = True
++) -> tuple[pd.DataFrame, float]:
++    """
++    Ledoit-Wolf shrinkage covariance estimator: shrinks the noisy sample
++    covariance towards a structured (scaled identity) target. This is
++    typically far more stable out-of-sample than the plain sample
++    covariance whenever the number of observations T is not much larger
++    than the number of assets N -- exactly the regime most real trading
++    universes are in.
++
++    Returns (covariance_df, shrinkage_intensity), where shrinkage_intensity
++    in [0, 1] measures how much weight was put on the structured target
++    (0 = pure sample covariance, 1 = pure structured target).
++    """
++    x = returns.dropna().to_numpy()
++    lw = LedoitWolf().fit(x)
++    cov = pd.DataFrame(lw.covariance_, index=returns.columns, columns=returns.columns)
++    return (cov * 252 if annualize else cov), float(lw.shrinkage_)
+diff -ruN '--exclude=__pycache__' '--exclude=.pytest_cache' '--exclude=results' v03_orig/src/data.py v03/quant_portfolio_risk_engine_v03/src/data.py
+--- v03_orig/src/data.py	2026-09-02 22:15:38.112088629 +0000
++++ v03/quant_portfolio_risk_engine_v03/src/data.py	2026-09-02 22:16:07.913366059 +0000
+@@ -1,5 +1,6 @@
+ from __future__ import annotations
+ 
++import numpy as np
+ import pandas as pd
+ import yfinance as yf
+ 
+@@ -8,29 +9,88 @@
+     tickers: list[str] | tuple[str, ...],
+     start: str,
+     end: str | None = None,
++    use_synthetic_fallback: bool = True,
++    seed: int = 42,
+ ) -> pd.DataFrame:
+-    """Download adjusted close prices and return a clean price matrix."""
+-    raw = yf.download(
+-        list(tickers),
+-        start=start,
+-        end=end,
+-        auto_adjust=True,
+-        progress=False,
+-    )
+-
+-    if raw.empty:
+-        raise RuntimeError("No market data were downloaded.")
+-
+-    if isinstance(raw.columns, pd.MultiIndex):
+-        if "Close" in raw.columns.get_level_values(0):
+-            prices = raw["Close"]
++    """
++    Download adjusted close prices and return a clean price matrix.
++
++    If live data cannot be retrieved (no internet, Yahoo Finance rate
++    limiting / outage, delisted tickers, etc.) and `use_synthetic_fallback`
++    is True, fall back to a reproducible synthetic multi-asset price panel
++    so the rest of the pipeline remains runnable end to end.
++    """
++    try:
++        raw = yf.download(
++            list(tickers),
++            start=start,
++            end=end,
++            auto_adjust=True,
++            progress=False,
++        )
++
++        if raw.empty:
++            raise RuntimeError("No market data were downloaded.")
++
++        if isinstance(raw.columns, pd.MultiIndex):
++            if "Close" in raw.columns.get_level_values(0):
++                prices = raw["Close"]
++            else:
++                prices = raw.xs("Close", axis=1, level=0)
+         else:
+-            prices = raw.xs("Close", axis=1, level=0)
+-    else:
+-        prices = raw[["Close"]].rename(columns={"Close": tickers[0]})
++            prices = raw[["Close"]].rename(columns={"Close": tickers[0]})
++
++        prices = prices.dropna(how="all").ffill().dropna()
++        if prices.empty:
++            raise RuntimeError("No usable price data after cleaning.")
++        return prices
++
++    except Exception as exc:  # noqa: BLE001 - any data/network issue triggers the fallback
++        if not use_synthetic_fallback:
++            raise
++        print(
++            f"[data] Live data unavailable ({exc.__class__.__name__}: {exc}). "
++            f"Falling back to a synthetic price panel so the pipeline can still run."
++        )
++        return _synthetic_prices(tickers, start=start, end=end, seed=seed)
++
++
++def _synthetic_prices(
++    tickers: list[str] | tuple[str, ...],
++    start: str,
++    end: str | None = None,
++    seed: int = 42,
++    annual_vol_range: tuple[float, float] = (0.12, 0.35),
++    annual_drift_range: tuple[float, float] = (0.01, 0.10),
++    market_beta_range: tuple[float, float] = (0.3, 1.4),
++) -> pd.DataFrame:
++    """
++    Generate a synthetic multi-asset price panel via GBM with a one-factor
++    (market) structure, so the resulting covariance matrix is non-trivial
++    (assets are correlated, not independent) -- this matters for testing
++    covariance estimation, PCA and portfolio optimization downstream.
++
++    NOT real market data. Only used when live data is unavailable, purely
++    to keep the pipeline demoable offline.
++    """
++    tickers = list(tickers)
++    rng = np.random.default_rng(seed)
++    dates = pd.bdate_range(start=start, end=end or pd.Timestamp.today())
++    n_days, n_assets = len(dates), len(tickers)
++
++    betas = rng.uniform(*market_beta_range, size=n_assets)
++    idio_vol = rng.uniform(*annual_vol_range, size=n_assets) / np.sqrt(252)
++    drift = rng.uniform(*annual_drift_range, size=n_assets) / 252
++    market_vol = 0.15 / np.sqrt(252)
++
++    market_shock = rng.normal(0, market_vol, size=n_days)
++    idio_shocks = rng.normal(0, 1, size=(n_days, n_assets)) * idio_vol
++
++    log_returns = drift + np.outer(market_shock, betas) + idio_shocks
++    log_prices = np.cumsum(log_returns, axis=0)
++    prices = 100 * np.exp(log_prices)
+ 
+-    prices = prices.dropna(how="all").ffill().dropna()
+-    return prices
++    return pd.DataFrame(prices, index=dates, columns=tickers)
+ 
+ 
+ def align_assets(prices: pd.DataFrame) -> pd.DataFrame:
+diff -ruN '--exclude=__pycache__' '--exclude=.pytest_cache' '--exclude=results' v03_orig/src/momentum.py v03/quant_portfolio_risk_engine_v03/src/momentum.py
+--- v03_orig/src/momentum.py	2026-09-02 22:15:38.112203787 +0000
++++ v03/quant_portfolio_risk_engine_v03/src/momentum.py	2026-09-02 22:16:34.989367669 +0000
+@@ -12,28 +12,57 @@
+     return prices.pct_change(lookback)
+ 
+ 
++def rebalance_schedule(
++    index: pd.DatetimeIndex, frequency: str = "ME"
++) -> pd.DatetimeIndex:
++    """
++    Actual trading days on which the portfolio rebalances: the last
++    trading day observed within each calendar period (e.g. month-end),
++    NOT the raw calendar period-end label.
++
++    This distinction matters: `some_series.resample("ME").last().index`
++    returns calendar period-end timestamps (e.g. 2024-01-31), which are
++    frequently *not* trading days (weekends/holidays). Checking
++    `trading_date in that_index` would then rarely match, silently
++    breaking the rebalance loop. Building the schedule from the actual
++    index (as done here) avoids that failure mode entirely.
++    """
++    grouped = pd.Series(index=index, data=index).groupby(pd.Grouper(freq=frequency))
++    last_trading_day_per_period = grouped.last().dropna()
++    return pd.DatetimeIndex(last_trading_day_per_period.values)
++
++
+ def cross_sectional_momentum_weights(
+     prices: pd.DataFrame,
+     lookback: int = 126,
+     top_fraction: float = 0.3,
++    rebalance_frequency: str = "ME",
+ ) -> pd.DataFrame:
+     """
+     Long-only cross-sectional momentum portfolio.
+ 
+-    At each date, invest equally in the top fraction of assets ranked by
+-    trailing momentum. Weights are shifted by one day to avoid look-ahead bias.
++    At each rebalance date (by default, month-end), invest equally in the
++    top fraction of assets ranked by trailing momentum, and HOLD that
++    allocation until the next rebalance date (rather than re-selecting
++    every single day the ranking shifts, which would produce unrealistic,
++    near-daily turnover). Weights are shifted by one day before being
++    applied to returns, to avoid look-ahead bias.
+     """
+     scores = momentum_scores(prices, lookback)
+     n_select = max(1, int(np.ceil(prices.shape[1] * top_fraction)))
++    rebalance_dates = set(rebalance_schedule(prices.index, rebalance_frequency))
+ 
+     raw = pd.DataFrame(0.0, index=prices.index, columns=prices.columns)
++    current = pd.Series(0.0, index=prices.columns)
+ 
+-    for date, row in scores.iterrows():
+-        valid = row.dropna()
+-        if len(valid) == 0:
+-            continue
+-        selected = valid.nlargest(min(n_select, len(valid))).index
+-        raw.loc[date, selected] = 1.0 / len(selected)
++    for date in prices.index:
++        if date in rebalance_dates:
++            row = scores.loc[date].dropna()
++            if len(row) > 0:
++                selected = row.nlargest(min(n_select, len(row))).index
++                current[:] = 0.0
++                current.loc[selected] = 1.0 / len(selected)
++        raw.loc[date] = current
+ 
+     # Signal generated from information available at t is held from t+1.
+     return raw.shift(1).fillna(0.0)
+@@ -44,11 +73,15 @@
+     lookback: int = 126,
+     top_fraction: float = 0.3,
+     transaction_cost_bps: float = 5.0,
++    rebalance_frequency: str = "ME",
+ ) -> tuple[pd.Series, pd.DataFrame]:
+     """Compute daily strategy returns including turnover-based transaction costs."""
+     asset_returns = prices.pct_change().fillna(0.0)
+     weights = cross_sectional_momentum_weights(
+-        prices, lookback=lookback, top_fraction=top_fraction
++        prices,
++        lookback=lookback,
++        top_fraction=top_fraction,
++        rebalance_frequency=rebalance_frequency,
+     )
+ 
+     gross = (weights * asset_returns).sum(axis=1)
+diff -ruN '--exclude=__pycache__' '--exclude=.pytest_cache' '--exclude=results' v03_orig/src/validation.py v03/quant_portfolio_risk_engine_v03/src/validation.py
+--- v03_orig/src/validation.py	1970-01-01 00:00:00.000000000 +0000
++++ v03/quant_portfolio_risk_engine_v03/src/validation.py	2026-09-02 22:17:13.133369936 +0000
+@@ -0,0 +1,106 @@
++from __future__ import annotations
++
++from dataclasses import dataclass
++
++import pandas as pd
++
++from .momentum import momentum_returns
++from .returns import annualized_return, annualized_volatility, max_drawdown, sharpe_ratio
++
++
++@dataclass
++class Fold:
++    train_start: pd.Timestamp
++    train_end: pd.Timestamp
++    test_start: pd.Timestamp
++    test_end: pd.Timestamp
++
++
++def generate_folds(
++    index: pd.DatetimeIndex,
++    train_years: int = 3,
++    test_years: int = 1,
++    step_years: int = 1,
++) -> list[Fold]:
++    """Rolling schedule of non-overlapping (relative to each other) test windows."""
++    start, end = index.min(), index.max()
++    folds: list[Fold] = []
++
++    train_start = start
++    while True:
++        train_end = train_start + pd.DateOffset(years=train_years)
++        test_start = train_end
++        test_end = test_start + pd.DateOffset(years=test_years)
++        if test_end > end:
++            break
++        folds.append(Fold(train_start, train_end, test_start, test_end))
++        train_start = train_start + pd.DateOffset(years=step_years)
++
++    return folds
++
++
++def walk_forward_momentum_validation(
++    prices: pd.DataFrame,
++    folds: list[Fold],
++    lookback: int = 126,
++    top_fraction: float = 0.3,
++    transaction_cost_bps: float = 5.0,
++    rebalance_frequency: str = "ME",
++    trading_days: int = 252,
++    annual_risk_free_rate: float = 0.0,
++) -> tuple[pd.Series, pd.DataFrame]:
++    """
++    Rolling train/test walk-forward validation of the momentum strategy.
++
++    The momentum rule itself has no free parameters fit on the training
++    window (the lookback is fixed by design, matching the published
++    12-1-style momentum convention). What the training window provides is
++    warm-up history so that, by the time each test window begins, the
++    signal and the rebalance schedule are already "live" -- exactly as
++    they would be in production. Performance is measured ONLY on the
++    out-of-sample test segment of each fold, so a strategy that only
++    works in one historical regime cannot hide behind a single blended
++    in-sample number.
++
++    Returns:
++        oos_returns: concatenated out-of-sample daily net returns across
++            all folds (chronologically sorted, non-overlapping).
++        fold_summary: per-fold out-of-sample performance table.
++    """
++    oos_segments = []
++    fold_rows = []
++
++    for i, fold in enumerate(folds):
++        window_prices = prices.loc[fold.train_start: fold.test_end]
++        net_returns, _ = momentum_returns(
++            window_prices,
++            lookback=lookback,
++            top_fraction=top_fraction,
++            transaction_cost_bps=transaction_cost_bps,
++            rebalance_frequency=rebalance_frequency,
++        )
++        test_returns = net_returns.loc[fold.test_start: fold.test_end]
++        if test_returns.empty:
++            continue
++
++        oos_segments.append(test_returns)
++        fold_rows.append(
++            {
++                "Fold": i + 1,
++                "Train Start": fold.train_start.date().isoformat(),
++                "Train End": fold.test_start.date().isoformat(),
++                "Test Start": fold.test_start.date().isoformat(),
++                "Test End": test_returns.index.max().date().isoformat(),
++                "Annual Return (%)": annualized_return(test_returns, trading_days) * 100,
++                "Annual Volatility (%)": annualized_volatility(test_returns, trading_days) * 100,
++                "Sharpe Ratio": sharpe_ratio(test_returns, annual_risk_free_rate, trading_days),
++                "Max Drawdown (%)": max_drawdown(test_returns) * 100,
++                "Observations": int(test_returns.notna().sum()),
++            }
++        )
++
++    oos_returns = (
++        pd.concat(oos_segments).sort_index() if oos_segments else pd.Series(dtype=float)
++    )
++    fold_summary = pd.DataFrame(fold_rows)
++    return oos_returns, fold_summary
+diff -ruN '--exclude=__pycache__' '--exclude=.pytest_cache' '--exclude=results' v03_orig/tests/test_core.py v03/quant_portfolio_risk_engine_v03/tests/test_core.py
+--- v03_orig/tests/test_core.py	2026-09-02 22:15:38.111913086 +0000
++++ v03/quant_portfolio_risk_engine_v03/tests/test_core.py	2026-09-02 22:19:29.013011650 +0000
+@@ -4,6 +4,9 @@
+ from src.returns import max_drawdown
+ from src.optimization import minimum_variance_portfolio
+ from src.risk import historical_var_es
++from src.covariance import ledoit_wolf_covariance
++from src.momentum import rebalance_schedule, cross_sectional_momentum_weights
++from src.validation import generate_folds
+ 
+ 
+ def test_max_drawdown():
+@@ -27,3 +30,55 @@
+     var, es = historical_var_es(r, 0.8)
+     assert var >= 0
+     assert es >= var
++
++
++def test_ledoit_wolf_shrinkage_intensity_in_unit_interval():
++    rng = np.random.default_rng(0)
++    returns = pd.DataFrame(rng.normal(0, 0.01, size=(100, 5)), columns=list("ABCDE"))
++    cov, shrinkage = ledoit_wolf_covariance(returns, annualize=False)
++    assert 0.0 <= shrinkage <= 1.0
++    assert cov.shape == (5, 5)
++    # covariance must be symmetric
++    assert np.allclose(cov.values, cov.values.T)
++
++
++def test_rebalance_schedule_only_returns_actual_trading_days():
++    # Business-day index for two months: every date in the schedule must
++    # be an actual trading day present in the index (this is exactly the
++    # bug the "M" -> "ME" fix and this helper guard against).
++    index = pd.bdate_range("2024-01-01", "2024-03-31")
++    schedule = rebalance_schedule(index, frequency="ME")
++    assert len(schedule) == 3
++    assert all(date in index for date in schedule)
++
++
++def test_momentum_weights_hold_between_rebalances():
++    # With monthly rebalancing, weights should NOT change on most days --
++    # only turnover should occur around rebalance dates plus the initial
++    # ramp-up. This guards against the previous bug where the top-K
++    # selection was silently re-evaluated every single day.
++    rng = np.random.default_rng(1)
++    index = pd.bdate_range("2020-01-01", "2021-12-31")
++    prices = pd.DataFrame(
++        100 * np.exp(np.cumsum(rng.normal(0, 0.01, size=(len(index), 4)), axis=0)),
++        index=index,
++        columns=list("ABCD"),
++    )
++    weights = cross_sectional_momentum_weights(
++        prices, lookback=60, top_fraction=0.5, rebalance_frequency="ME"
++    )
++    turnover_days = (weights.diff().abs().sum(axis=1) > 1e-9).sum()
++    # ~24 months of history -> turnover should occur on a small number of
++    # days (approximately one per rebalance), not on a large fraction of
++    # all trading days.
++    assert turnover_days < 40
++
++
++def test_generate_folds_are_chronological_and_non_overlapping_tests():
++    index = pd.bdate_range("2015-01-01", "2024-12-31")
++    folds = generate_folds(index, train_years=3, test_years=1, step_years=1)
++    assert len(folds) > 0
++    for fold in folds:
++        assert fold.train_start < fold.train_end == fold.test_start < fold.test_end
++    for prev, nxt in zip(folds, folds[1:]):
++        assert nxt.train_start > prev.train_start
